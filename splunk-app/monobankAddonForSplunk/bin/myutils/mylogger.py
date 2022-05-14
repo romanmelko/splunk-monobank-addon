@@ -20,8 +20,8 @@ if 'SPLUNK_HOME' in os.environ:
     for log_subdir in log_subdirs:
         log_dir = os.path.join(log_dir, log_subdir)
     LOG_DIR = log_dir
-elif os.path.exists(os.path.expandvars('/tmp')):
-    LOG_DIR = os.path.expandvars('/tmp')
+# elif os.path.exists(os.path.expandvars('/tmp')):
+#     LOG_DIR = os.path.expandvars('/tmp')
 else:
     log_dir = os.path.dirname(os.path.abspath(inspect.stack()[1][1]))
     LOG_DIR = os.path.expandvars(log_dir)
@@ -43,8 +43,7 @@ class Logger():
 
     def _get_logger(self):
         logger = logging.getLogger(self.log_name)
-        handler = logging.FileHandler(
-            '{}/{}.log'.format(LOG_DIR, self.log_name))
+        handler = logging.FileHandler(self.log_file_path)
         formatter = logging.Formatter(LOG_FORMAT)
         logging.Formatter.converter = time.gmtime
         handler.setFormatter(formatter)
