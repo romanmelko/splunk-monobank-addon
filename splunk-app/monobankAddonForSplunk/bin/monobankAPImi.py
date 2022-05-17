@@ -4,6 +4,8 @@
 """
 
 import sys
+import os
+import logging
 import json
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
@@ -11,19 +13,62 @@ from urllib.error import HTTPError
 import requests
 import pytz
 from splunklib import modularinput
-from myutils import splunkutils, mylogger
+from pythonjsonlogger import jsonlogger
+from myutils import splunkutils
+
+
+SPLUNK_MI_NAME = 'Costs Monobank API'
+SPLUNK_MI_DESC = 'Streams events from Monobank'
+if 'SPLUNK_HOME' in os.environ:
+    SPLUNK_HOME_DIR = os.path.expandvars('$SPLUNK_HOME')
+    log_subdirs = ['var', 'log']
+    log_dir = os.path.join(SPLUNK_HOME_DIR)
+    for log_subdir in log_subdirs:
+        log_dir = os.path.join(log_dir, log_subdir)
+    LOG_DIR = log_dir
+else:
+    log_dir = os.path.dirname(os.path.realpath(__file__))
+    LOG_DIR = os.path.expandvars(log_dir)
+INIT_DATE_FMT = '%Y-%m-%d'
+TZ = pytz.timezone('Europe/Kiev') # since this is bank from Ukraine
+REST_URI = 'https://api.monobank.ua/personal/statement/'
+
+
+class CustomJsonFormatter(jsonlogger.JsonFormatter):
+    """ Custom JSON logging """
+    input_name = None
+
+    def add_fields(self, log_record, record, message_dict):
+        super().add_fields(log_record, record, message_dict)
+        if not log_record.get('timestamp'):
+            # this doesn't use record.created, so it is slightly off
+            now = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+            log_record['timestamp'] = now
+        if log_record.get('level'):
+            log_record['level'] = log_record['level'].upper()
+        else:
+            log_record['level'] = record.levelname
+        # add custom static field in log message
+        log_record['input_name'] = self.input_name
+        log_record['function'] = str(sys._getframe(10).f_code.co_name)
 
 
 class CostsModularInput(modularinput.Script):
     """ Modular input Script class for reading costs source data """
-    tz = pytz.timezone('Europe/Kiev') # since this is bank from Ukraine
-    rest_endpoint = 'https://api.monobank.ua/personal/statement/'
-    init_date_fmt = '%Y-%m-%d'
-    fmt = '%Y-%m-%d %H:%M:%S'
+
+    def __init__(self):
+        super().__init__()
+        self.splunk_query = None
+        self.splunk_args = None
+        self.index = None
+        self.source = None
+        self.sourcetype = None
+        self.mgmt_endpoint = None
+        self.session_key = None
 
     def _set_params(self):
-        self.splunk_query = '| tstats latest(_time) as timestamp where index=' + str(self.index) + \
-                ' sourcetype=' + self.source_type + \
+        self.splunk_query = '| tstats latest(_time) as timestamp where index=' + self.index + \
+                ' sourcetype=' + self.sourcetype + \
                 ' source=' + self.source + \
                 '| append [| makeresults ] ' \
                 '| eval timestamp = if(isnotnull(timestamp), timestamp, 0) ' \
@@ -35,8 +80,8 @@ class CostsModularInput(modularinput.Script):
 
     def _final_date(self):
         """ Do not get today's transactions """
-        now_date = self.tz.localize(datetime.now())
-        final_date = self.tz.localize(
+        now_date = TZ.localize(datetime.now())
+        final_date = TZ.localize(
             datetime.combine((now_date).date(), datetime.min.time())) - \
                     timedelta(seconds=1)
         return final_date
@@ -50,13 +95,14 @@ class CostsModularInput(modularinput.Script):
         self._set_params()
         splunk_utils = splunkutils.ModularInput()
         splunk = splunkutils.Splunk()
-        log.debug(str(self.splunk_query))
+        log.debug('Splunk checkpoint query', extra={'splunk_query': str(self.splunk_query)})
         splunk_latest_dt = splunk_utils.get_init_datetime(splunk, self.splunk_query,
                                                           self.splunk_args, init_datetime)
         tz_from_datetime = pytz.utc.localize(splunk_latest_dt)
-        log.info('Init date: ' + str(tz_from_datetime))
+        log.info('Init date: %s', str(tz_from_datetime))
         if tz_from_datetime <= tz_to_datetime:
-            log.info('Getting events ' + str(tz_from_datetime) + ' - ' + str(tz_to_datetime))
+            log.info('Getting events in time range: %s', str(tz_from_datetime) \
+                 + ' - %s', str(tz_to_datetime))
         else:
             log.info('Not grabbing events today')
             return
@@ -65,13 +111,13 @@ class CostsModularInput(modularinput.Script):
         rest_to_timestamp = int((tz_to_datetime - pytz.utc.localize(datetime(1970, 1, 1)))
                                 .total_seconds())
         try:
-            mono = requests.get(self.rest_endpoint +
+            mono = requests.get(REST_URI +
                                 str(card_id) + '/' + str(rest_from_timestamp) + '/' +
                                 str(rest_to_timestamp),
                                 headers={"X-Token":token})
         except HTTPError:
-            raise Exception('Non 2xx HTTP response code: ' + str(HTTPError))
-        log.debug(str(mono.content))
+            log.exception('Non 2xx HTTP response code received')
+        log.debug('Data received', extra={'data': str(mono.content)})
         for item in json.loads(mono.text):
             yield json.dumps(item)
 
@@ -110,43 +156,37 @@ class CostsModularInput(modularinput.Script):
 
         return scheme
 
-    def _validate_date(self, date_text):
-        try:
-            datetime.strptime(date_text, self.init_date_fmt)
-        except ValueError:
-            raise ValueError('Incorrect date format, should be YYYY-MM-DD')
-
-    def _validate_log_level(self, log_level):
-        if not log_level in ('INFO', 'DEBUG'):
-            raise ValueError('Incorrect log level format, should be INFO|DEBUG')
-
     def validate_input(self, validation_definition):
         """Checks user-provided params for the modular input.
         Raises:
           OSError if monitor_dir_name does not exist or is unreadable.
         """
         init_date = str(validation_definition.parameters['init_date'])
-        self._validate_date(init_date)
+        try:
+            datetime.strptime(init_date, INIT_DATE_FMT)
+        except ValueError:
+            log.exception('Incorrect date format, should be YYYY-MM-DD')
         log_level = str(validation_definition.parameters['log_level'])
-        self._validate_log_level(log_level)
+        if log_level not in ('INFO', 'DEBUG'):
+            log.exception('Incorrect log level format, should be INFO|DEBUG')
 
     def stream_events(self, inputs, event_writer):
         """Writes event objects to event_writer."""
         try:
             for input_name, input_item in inputs.inputs.items():
-                log.source = input_name
+                CustomJsonFormatter.input_name = input_name
+                log.info('Initializing modular input')
                 log.setLevel(input_item['log_level'])
                 if input_item['index'] == 'default':
-                    self.index = 'main'
+                    input_item['index'] = 'main'
                 else:
                     self.index = input_item['index']
-                self.source_type = input_item['sourcetype']
+                self.source = input_name
+                self.sourcetype = input_item['sourcetype']
                 self.session_key = self._input_definition.metadata['session_key']
                 self.mgmt_endpoint = urlparse(
                     self._input_definition.metadata['server_uri'])
-                log.info('Initializing ' + input_name)
                 event_count = 0
-                self.source = input_name
                 for item in self.monobank(
                         input_item['init_date'], input_item['card_id'],
                         input_item['token']):
@@ -157,16 +197,23 @@ class CostsModularInput(modularinput.Script):
                     )
                     event_writer.write_event(splunk_event)
                     event_count += 1
-                log.info('Total events ingested: ' + str(event_count))
+                log.info('Ingestion to Splunk complete', extra={'event_count': event_count})
         except Exception as exception:
             log.exception(exception)
             raise
 
 
 if __name__ == '__main__':
-    log = mylogger.Logger(level='INFO')
-    SPLUNK_MI_NAME = 'Costs Monobank API'
-    SPLUNK_MI_DESC = 'Streams events from Monobank'
+    # set logger
+    formatter = CustomJsonFormatter('%(timestamp)s %(level)s %(message)s')
+    log = logging.getLogger()
+    log_file_path = os.path.join(LOG_DIR, os.path.splitext(
+        os.path.basename(__file__))[0]) + '.log.json'
+    file_handler = logging.FileHandler(log_file_path)
+    file_handler.setFormatter(formatter)
+    log.addHandler(file_handler)
+    log.setLevel(logging.INFO)
+
     try:
         sys.exit(CostsModularInput().run(sys.argv))
     except Exception as exception:
